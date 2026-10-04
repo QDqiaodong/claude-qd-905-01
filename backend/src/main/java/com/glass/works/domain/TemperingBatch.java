@@ -145,4 +145,71 @@ public class TemperingBatch {
         int sec = heatSeconds == null ? 0 : heatSeconds;
         return BigDecimal.valueOf(sec / 60.0).setScale(1, RoundingMode.HALF_UP);
     }
+
+    /** 已走完整个炉程（加热 → 淬冷 → 冷却 → 完成），终态不可再推进 */
+    @Transient
+    public boolean isFinished() {
+        return "DONE".equals(stage);
+    }
+
+    /**
+     * 是否已有有效出炉结果：阶段已完成且登记过正的出炉片数。
+     * 出炉结果全生命周期只允许首次确认一次，以此为「已锁定」判据。
+     */
+    @Transient
+    public boolean hasValidResult() {
+        return "DONE".equals(stage) && outputCount != null && outputCount > 0;
+    }
+
+    /** 出炉结果已确认并锁定：合格片数 / 破碎率只读，重复出炉一律不得改写 */
+    @Transient
+    public boolean isResultLocked() {
+        return hasValidResult();
+    }
+
+    /**
+     * 历史遗留：阶段已推进到完成、但出炉片数缺失（未做过有效出炉登记）。
+     * 这是真实完成的批次、不是可重新生产的在炉批次，仅允许补录一次出炉结果。
+     */
+    @Transient
+    public boolean isAwaitingBackfill() {
+        return "DONE".equals(stage) && (outputCount == null || outputCount <= 0);
+    }
+
+    /** 出炉登记按钮是否可用：未完成的在炉批次登记，或完成但缺片数的历史批次补录一次 */
+    @Transient
+    public boolean canDischarge() {
+        return !"DONE".equals(stage) || isAwaitingBackfill();
+    }
+
+    /** 推进按钮是否可用：完成（无论是否已补录）即终态只读 */
+    @Transient
+    public boolean canAdvance() {
+        return !"DONE".equals(stage);
+    }
+
+    /** 不可继续操作的明确原因（页面 / 台账只读提示用；可操作时为 null） */
+    @Transient
+    public String getLockReason() {
+        if (hasValidResult()) {
+            return "该批次已完成并确认出炉结果（出炉 " + outputCount + " 片、破碎 "
+                    + (brokenCount == null ? 0 : brokenCount) + " 片），结果已锁定，不可再推进或重新出炉";
+        }
+        if (isAwaitingBackfill()) {
+            return "该批次炉程已完成但出炉片数缺失，仅允许补录一次出炉结果，不可重新推进生产";
+        }
+        return null;
+    }
+
+    /** 阶段中文名（台账列表直接序列化实体时前端展示用） */
+    @Transient
+    public String getStageName() {
+        return switch (stage == null ? "" : stage) {
+            case "HEATING" -> "加热段";
+            case "QUENCH" -> "淬冷段";
+            case "COOLING" -> "冷却段";
+            case "DONE" -> "已出炉";
+            default -> stage;
+        };
+    }
 }

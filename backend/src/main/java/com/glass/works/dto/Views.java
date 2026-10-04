@@ -101,6 +101,20 @@ public final class Views {
         private Double brokenRate;
         private String stage;
         private String stageName;
+        /** 阶段已完成（终态），不可再推进 */
+        private boolean finished;
+        /** 出炉结果已首次确认并锁定，合格片数 / 破碎率只读 */
+        private boolean resultLocked;
+        /** 阶段已完成但片数缺失，允许补录一次 */
+        private boolean awaitingBackfill;
+        /** 出炉登记按钮是否可用 */
+        private boolean canDischarge;
+        /** 推进按钮是否可用 */
+        private boolean canAdvance;
+        /** 不可继续操作的明确原因（可操作时为 null） */
+        private String lockReason;
+        /** 本次操作给页面的说明（如重复出炉被保留时的提示，普通查询为 null） */
+        private String notice;
         private String operator;
         private List<StageVO> stages = new ArrayList<>();
     }

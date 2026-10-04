@@ -74,18 +74,25 @@ public class ProcessController {
         return ApiResponse.success("工艺参数已更新", service.updateTempering(id, request));
     }
 
-    /** 炉内推进：加热段 → 淬冷段 → 冷却段 → 出炉 */
+    /** 炉内推进：加热段 → 淬冷段 → 冷却段 → 完成；已完成的批次不可再推进 */
     @PostMapping("/tempering/{id}/advance")
     public ApiResponse<FurnaceVO> advance(@PathVariable Long id) {
-        return ApiResponse.success("炉内推进一段", service.advance(id));
+        FurnaceVO vo = service.advance(id);
+        String message = "已推进到「" + vo.getStageName() + "」";
+        if (vo.getNotice() != null) {
+            message = vo.getNotice();
+        }
+        return ApiResponse.success(message, vo);
     }
 
-    /** 出炉登记：破碎片数不得超过出炉片数 */
+    /** 出炉登记：出炉结果只允许首次确认一次，重复提交不同片数返回 409 且原结果保留 */
     @PostMapping("/tempering/{id}/discharge")
     public ApiResponse<FurnaceVO> discharge(@PathVariable Long id,
                                             @RequestParam Integer outputCount,
                                             @RequestParam(required = false) Integer brokenCount) {
-        return ApiResponse.success("出炉已登记", service.discharge(id, outputCount, brokenCount));
+        FurnaceVO vo = service.discharge(id, outputCount, brokenCount);
+        String message = vo.getNotice() != null ? vo.getNotice() : "出炉已登记";
+        return ApiResponse.success(message, vo);
     }
 
     @GetMapping("/furnace-stat")

@@ -1,6 +1,7 @@
 package com.glass.works.service;
 
 import com.glass.works.common.BizException;
+import com.glass.works.common.ConflictException;
 import com.glass.works.common.Dict;
 import com.glass.works.domain.EdgeGrinding;
 import com.glass.works.domain.TemperingBatch;
@@ -121,19 +122,23 @@ public class ProcessService {
         batch.setQuenchPressure(request.getQuenchPressure());
         batch.setWarpage(request.getWarpage());
         batch.setParticleCount(request.getParticleCount());
-        batch.setOutputCount(request.getOutputCount());
-        batch.setBrokenCount(request.getBrokenCount() == null ? 0 : request.getBrokenCount());
+        // 出炉片数 / 破碎片数只能由「出炉登记」首次确认，建档时不带出炉结果
+        batch.setOutputCount(null);
+        batch.setBrokenCount(0);
         batch.setOperator(request.getOperator());
         batch.setStage("HEATING");
         batch.setCreatedAt(LocalDateTime.now());
         return temperingRepository.save(batch);
     }
 
-    /** 只改工艺参数（滑块）并同步校验 */
+    /** 只改工艺参数（滑块）并同步校验；已完成批次历史数据只读 */
     @Transactional
     public TemperingBatch updateTempering(Long id, TemperingRequest request) {
-        TemperingBatch batch = temperingRepository.findById(id)
+        TemperingBatch batch = temperingRepository.findLockedById(id)
                 .orElseThrow(() -> new BizException("钢化批次不存在：" + id));
+        if (batch.isFinished()) {
+            throw new ConflictException(batch.getLockReason());
+        }
         if (request.getTempLow() != null) {
             batch.setTempLow(request.getTempLow());
         }
@@ -161,26 +166,43 @@ public class ProcessService {
         return temperingRepository.save(batch);
     }
 
-    /** 炉内推进：加热段 → 淬冷段 → 冷却段 → 出炉 */
+    /** 炉内推进：加热段 → 淬冷段 → 冷却段 → 完成；完成即终态，刷新或重复点击都不得回到加热段 */
     @Transactional
     public FurnaceVO advance(Long id) {
-        TemperingBatch batch = temperingRepository.findById(id)
+        TemperingBatch batch = temperingRepository.findLockedById(id)
                 .orElseThrow(() -> new BizException("钢化批次不存在：" + id));
         String stage = batch.getStage() == null ? "HEATING" : batch.getStage();
-        batch.setStage(switch (stage) {
+        if (batch.isFinished()) {
+            throw new ConflictException(batch.getLockReason());
+        }
+        String next = switch (stage) {
             case "HEATING" -> "QUENCH";
             case "QUENCH" -> "COOLING";
             case "COOLING" -> "DONE";
-            default -> "HEATING";
-        });
+            default -> throw new BizException("钢化批次 " + batch.getBatchNo()
+                    + " 当前炉段标识非法：" + stage);
+        };
+        batch.setStage(next);
         temperingRepository.save(batch);
-        return toVO(batch);
+        FurnaceVO vo = toVO(batch);
+        if ("DONE".equals(next) && batch.isAwaitingBackfill()) {
+            vo.setNotice("炉程已全部走完，但尚未登记出炉片数，请在右侧补录一次出炉结果");
+        }
+        return vo;
     }
 
-    /** 记录出炉结果：破碎片数不得超过出炉片数 */
+    /**
+     * 出炉登记：出炉结果全生命周期只允许首次确认一次。
+     * <ul>
+     *   <li>在炉批次：首次确认出炉片数 / 破碎片数，阶段置完成并锁定；</li>
+     *   <li>阶段已完成但片数缺失的历史批次：按真实完成批次补录一次，补录后锁定；</li>
+     *   <li>已有有效出炉结果的完成批次：保留原结果。再次提交相同片数直接说明；
+     *       提交不同片数抛 409 冲突，绝不能改写合格片数与破碎率。</li>
+     * </ul>
+     */
     @Transactional
     public FurnaceVO discharge(Long id, Integer outputCount, Integer brokenCount) {
-        TemperingBatch batch = temperingRepository.findById(id)
+        TemperingBatch batch = temperingRepository.findLockedById(id)
                 .orElseThrow(() -> new BizException("钢化批次不存在：" + id));
         if (outputCount == null || outputCount <= 0) {
             throw new BizException("出炉片数必须为正整数");
@@ -189,11 +211,35 @@ public class ProcessService {
         if (broken > outputCount) {
             throw new BizException("破碎片数 " + broken + " 不得超过出炉片数 " + outputCount);
         }
+
+        FurnaceVO vo = toVO(batch);
+        if (batch.isResultLocked()) {
+            int oldBroken = batch.getBrokenCount() == null ? 0 : batch.getBrokenCount();
+            boolean same = batch.getOutputCount() == outputCount && oldBroken == broken;
+            String detail = "原出炉结果：出炉 " + batch.getOutputCount() + " 片、破碎 " + oldBroken
+                    + " 片、合格 " + batch.getGoodCount() + " 片、破碎率 " + batch.getBrokenRate() + "%";
+            if (same) {
+                // 原结果原样保留，仅把保留原因说明返回，不触碰任何片数
+                vo.setNotice("该批次出炉结果已确认，本次提交与首次结果一致，原结果已保留：" + detail);
+                return vo;
+            }
+            throw new ConflictException("该批次已完成，出炉结果只允许首次确认一次。"
+                    + "本次提交（出炉 " + outputCount + " 片、破碎 " + broken + " 片）与原结果不一致，"
+                    + detail + "，原结果保留不变，不允许改写合格片数与破碎率");
+        }
+
+        boolean backfill = batch.isAwaitingBackfill();
         batch.setOutputCount(outputCount);
         batch.setBrokenCount(broken);
         batch.setStage("DONE");
         temperingRepository.save(batch);
-        return toVO(batch);
+        vo = toVO(batch);
+        vo.setNotice(backfill
+                ? "历史完成批次的出炉结果已补录（出炉 " + outputCount + " 片、破碎 " + broken
+                        + " 片），补录后结果锁定，不再接受重复出炉"
+                : "出炉结果已确认（出炉 " + outputCount + " 片、破碎 " + broken
+                        + " 片），批次完成并锁定");
+        return vo;
     }
 
     private void validateTempering(TemperingRequest request) {
@@ -250,6 +296,12 @@ public class ProcessService {
         vo.setBrokenRate(batch.getBrokenRate());
         vo.setStage(batch.getStage());
         vo.setStageName(Dict.stageName(batch.getStage()));
+        vo.setFinished(batch.isFinished());
+        vo.setResultLocked(batch.isResultLocked());
+        vo.setAwaitingBackfill(batch.isAwaitingBackfill());
+        vo.setCanDischarge(batch.canDischarge());
+        vo.setCanAdvance(batch.canAdvance());
+        vo.setLockReason(batch.getLockReason());
         vo.setOperator(batch.getOperator());
 
         int seconds = batch.getHeatSeconds() == null ? 0 : batch.getHeatSeconds();
