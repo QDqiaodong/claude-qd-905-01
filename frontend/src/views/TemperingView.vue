@@ -32,6 +32,20 @@ const STAGE_POS = { HEATING: 8, QUENCH: 42, COOLING: 74, DONE: 95 }
 
 const stagePos = computed(() => STAGE_POS[furnace.value?.stage] ?? 8)
 
+// ---- 终态 / 补录只读标志（全部以后端 FurnaceVO 为准，页面不自行推断） ----
+const isFinished = computed(() => furnace.value?.finished === true)
+const hasResult = computed(() => furnace.value?.hasResult === true)
+const resultMissing = computed(() => furnace.value?.resultMissing === true)
+const canAdvance = computed(() => furnace.value?.canAdvance === true)
+const canDischarge = computed(() => furnace.value?.canDischarge === true)
+const paramsLocked = computed(() => isFinished.value)
+const dischargeLabel = computed(() => resultMissing.value ? '补录出炉结果' : '出炉登记')
+
+const STAGE_TAG = { HEATING: 'danger', QUENCH: '', COOLING: 'warning', DONE: 'success' }
+function stageTagType(stage) {
+  return STAGE_TAG[stage] || 'info'
+}
+
 const donut = computed(() => {
   const rate = furnace.value?.brokenRate || 0
   const c = 2 * Math.PI * 52
@@ -59,12 +73,18 @@ async function advance() {
     ElMessage.success('推进到「' + furnace.value.stageName + '」')
     await loadList()
   } catch (e) {
+    // 已完成再推进：后端返回 409 中文冲突说明（含原出炉结果），刷新后仍停在已出炉
     ElMessage.error(e.message)
+    await loadBatch(batchId.value)
   }
 }
 
 async function saveParams() {
   if (!batchId.value) return
+  if (paramsLocked.value) {
+    ElMessage.warning(furnace.value.lockReason || '该批次已出炉，工艺参数不可调整')
+    return
+  }
   try {
     await api.process.updateTempering(batchId.value, {
       heatTemp: params.value.heatTemp,
@@ -85,17 +105,57 @@ async function loadList() {
   batches.value = await api.process.temperingList()
 }
 
-async function discharge() {
-  if (!batchId.value) return
-  const out = furnace.value?.outputCount || 6
-  const broken = furnace.value?.brokenCount || 0
+// ---- 出炉登记 / 历史补录（结果只确认一次，重复提交后端拒绝并保留原结果） ----
+const dischargeDialog = ref(false)
+const dischargeForm = ref({ outputCount: 6, brokenCount: 0 })
+
+function openDischarge() {
+  if (!furnace.value) return
+  if (!canDischarge.value) {
+    ElMessage.warning(furnace.value.lockReason || '当前阶段不能登记出炉')
+    return
+  }
+  // 补录场景原片数缺失，给个默认值；正常出炉沿用已有值
+  dischargeForm.value.outputCount = furnace.value.outputCount > 0 ? furnace.value.outputCount : 6
+  dischargeForm.value.brokenCount = furnace.value.brokenCount || 0
+  dischargeDialog.value = true
+}
+
+async function submitDischarge() {
+  const out = Number(dischargeForm.value.outputCount)
+  const broken = Number(dischargeForm.value.brokenCount || 0)
+  if (!out || out <= 0) {
+    ElMessage.warning('出炉片数必须为正整数')
+    return
+  }
+  if (broken > out) {
+    ElMessage.warning('破碎片数不得超过出炉片数')
+    return
+  }
   try {
     furnace.value = await api.process.discharge(batchId.value, out, broken)
-    ElMessage.success('出炉登记完成')
+    dischargeDialog.value = false
+    ElMessage.success(resultMissing.value
+      ? '历史出炉结果已补录，该批次转为只读'
+      : '出炉登记完成，批次已终态锁定')
     await loadList()
+    await loadBatch(batchId.value)
   } catch (e) {
+    // 重复出炉（含不同片数）：后端保留原结果并返回明确冲突说明
     ElMessage.error(e.message)
+    dischargeDialog.value = false
+    await loadBatch(batchId.value)
   }
+}
+
+function selectRow(row) {
+  loadBatch(row.id)
+}
+
+function ledgerRowClass({ row }) {
+  if (row.finished && row.hasResult) return 'row-finished'
+  if (row.resultMissing) return 'row-missing'
+  return ''
 }
 
 // ---------------- 磨边 ----------------
@@ -137,23 +197,47 @@ onMounted(async () => {
   <div>
     <div class="view-head">
       <div class="view-title">磨边与钢化 · 钢化炉温控隧道</div>
-      <div class="view-tip">加热段 → 淬冷段 → 冷却段；温度必须在 620~720℃，破碎片数不得超过出炉片数</div>
+      <div class="view-tip">加热段 → 淬冷段 → 冷却段 → 完成，炉段单向不可回退；出炉结果只确认一次，已出炉批次终态只读（温度必须在 620~720℃，破碎片数不得超过出炉片数）</div>
     </div>
 
     <!-- 批次选择玻璃条 -->
     <div class="glass-bar">
       <span class="glass-bar-label">钢化批次</span>
       <el-select v-model="batchId" size="small" style="width: 300px" @change="loadBatch">
-        <el-option v-for="b in batches" :key="b.id" :label="b.batchNo + ' · ' + b.furnaceNo + ' · ' + b.tempRange" :value="b.id" />
+        <el-option v-for="b in batches" :key="b.id"
+          :label="b.batchNo + ' · ' + b.furnaceNo + ' · ' + b.stageName + (b.resultMissing ? ' · 待补录' : '')"
+          :value="b.id" />
       </el-select>
-      <span class="glass-bar-label" v-if="furnace">
-        温控区间 {{ furnace.tempRange }}℃ · 当前炉段 {{ furnace.stageName }}
-      </span>
+      <el-tag v-if="furnace" size="small" :type="stageTagType(furnace.stage)" effect="dark" style="margin-left: 8px">
+        当前阶段：{{ furnace.stageName }}
+      </el-tag>
+      <span class="glass-bar-label" v-if="furnace">温控区间 {{ furnace.tempRange }}℃</span>
       <span style="margin-left: auto">
-        <el-button size="small" type="primary" @click="advance">进炉推进</el-button>
-        <el-button size="small" @click="discharge">出炉登记</el-button>
+        <el-tooltip :disabled="canAdvance" :content="furnace?.lockReason || '已完成的批次不能重新推进'" placement="top">
+          <span class="btn-wrap">
+            <el-button size="small" type="primary" :disabled="!canAdvance" @click="advance">炉内推进</el-button>
+          </span>
+        </el-tooltip>
+        <el-tooltip :disabled="canDischarge" :content="furnace?.lockReason || '当前阶段不能登记出炉'" placement="top">
+          <span class="btn-wrap">
+            <el-button size="small" :type="resultMissing ? 'warning' : 'success'" :disabled="!canDischarge" @click="openDischarge">
+              {{ dischargeLabel }}
+            </el-button>
+          </span>
+        </el-tooltip>
       </span>
     </div>
+
+    <!-- 终态 / 待补录 状态条：明确显示当前阶段、最终结果与不可继续操作的原因 -->
+    <el-alert v-if="furnace && isFinished" :closable="false" show-icon class="state-banner"
+      :type="hasResult ? 'success' : 'warning'"
+      :title="hasResult
+        ? `批次 ${furnace.batchNo} 已完成（已出炉）· 最终结果：出炉 ${furnace.outputCount} 片 / 破碎 ${furnace.brokenCount} 片 / 合格 ${furnace.goodCount} 片 / 破碎率 ${furnace.brokenRate}%`
+        : `批次 ${furnace.batchNo} 已走完炉段但缺少出炉片数，请补录一次出炉结果（仅此一次，补录后只读）`">
+      <template #default>
+        <span>{{ furnace.lockReason }}</span>
+      </template>
+    </el-alert>
 
     <div class="grid-2">
       <!-- 左：隧道 -->
@@ -179,13 +263,17 @@ onMounted(async () => {
 
         <!-- 三个参数滑块 -->
         <div class="slider-block">
+          <el-alert v-if="paramsLocked" :closable="false" type="info" show-icon class="param-lock"
+            :title="resultMissing
+              ? '炉段已完成：滑块与工艺参数已冻结，仅可在上方补录一次出炉片数'
+              : '已出炉批次工艺参数随最终结果冻结，不可再调整'" />
           <div class="slider-row" :class="{ bad: tempOut }">
             <div class="s-head"><span>加热温度</span>
               <b>{{ params.heatTemp }} ℃</b>
               <em v-if="tempOut">超出允许区间 620~720℃</em>
               <em v-else class="ok">允许 620~720 ℃</em>
             </div>
-            <el-slider :class="{ danger: tempOut }" v-model="params.heatTemp" :min="560" :max="780" :step="1" />
+            <el-slider :class="{ danger: tempOut }" v-model="params.heatTemp" :min="560" :max="780" :step="1" :disabled="paramsLocked" />
           </div>
           <div class="slider-row" :class="{ bad: secOut }">
             <div class="s-head"><span>加热时长</span>
@@ -193,7 +281,7 @@ onMounted(async () => {
               <em v-if="secOut">超出允许区间 90~600s</em>
               <em v-else class="ok">允许 90~600 s</em>
             </div>
-            <el-slider :class="{ danger: secOut }" v-model="params.heatSeconds" :min="60" :max="700" :step="10" />
+            <el-slider :class="{ danger: secOut }" v-model="params.heatSeconds" :min="60" :max="700" :step="10" :disabled="paramsLocked" />
           </div>
           <div class="slider-row" :class="{ bad: qpOut }">
             <div class="s-head"><span>淬冷风压</span>
@@ -201,7 +289,7 @@ onMounted(async () => {
               <em v-if="qpOut">超出允许区间 1.5~6.5kPa</em>
               <em v-else class="ok">允许 1.5~6.5 kPa</em>
             </div>
-            <el-slider :class="{ danger: qpOut }" v-model="params.quenchPressure" :min="0" :max="8" :step="0.1" />
+            <el-slider :class="{ danger: qpOut }" v-model="params.quenchPressure" :min="0" :max="8" :step="0.1" :disabled="paramsLocked" />
           </div>
           <div class="slider-row">
             <div class="s-head"><span>工艺温控区间</span>
@@ -209,10 +297,10 @@ onMounted(async () => {
               <em class="ok">该区间串由 temp_range 派生列拆合</em>
             </div>
             <div class="range-row">
-              <el-input-number v-model="tempRange.tempLow" :min="600" :max="720" size="small" controls-position="right" />
+              <el-input-number v-model="tempRange.tempLow" :min="600" :max="720" size="small" controls-position="right" :disabled="paramsLocked" />
               <span>—</span>
-              <el-input-number v-model="tempRange.tempHigh" :min="600" :max="760" size="small" controls-position="right" />
-              <el-button size="small" type="primary" @click="saveParams">保存参数</el-button>
+              <el-input-number v-model="tempRange.tempHigh" :min="600" :max="760" size="small" controls-position="right" :disabled="paramsLocked" />
+              <el-button size="small" type="primary" :disabled="paramsLocked" @click="saveParams">保存参数</el-button>
             </div>
           </div>
         </div>
@@ -220,7 +308,13 @@ onMounted(async () => {
 
       <!-- 右：当炉统计 -->
       <div class="glass glass-pad">
-        <div class="section-title">当炉统计</div>
+        <div class="section-title">
+          当炉统计
+          <el-tag v-if="furnace" size="small" :type="stageTagType(furnace.stage)" effect="plain" style="margin-left: 8px">
+            {{ furnace.stageName }}
+          </el-tag>
+          <el-tag v-if="furnace && resultMissing" size="small" type="warning" effect="plain" style="margin-left: 6px">待补录</el-tag>
+        </div>
         <div class="stat-wrap">
           <svg viewBox="0 0 140 140" class="donut">
             <circle cx="70" cy="70" r="52" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="14" />
@@ -236,12 +330,16 @@ onMounted(async () => {
             <text x="70" y="86" text-anchor="middle" font-size="11" fill="#b9c4ee">破碎率</text>
           </svg>
           <div class="stat-cards">
-            <div class="mini-card"><div class="k">出炉片数</div><div class="v">{{ furnace ? furnace.outputCount : 0 }}</div></div>
-            <div class="mini-card"><div class="k">破碎片数</div><div class="v" style="color:#ffb74d">{{ furnace ? furnace.brokenCount : 0 }}</div></div>
-            <div class="mini-card"><div class="k">完好片数</div><div class="v" style="color:#4dd6a8">{{ furnace ? furnace.goodCount : 0 }}</div></div>
+            <div class="mini-card"><div class="k">出炉片数</div><div class="v">{{ furnace && furnace.outputCount > 0 ? furnace.outputCount : (resultMissing ? '待补录' : 0) }}</div></div>
+            <div class="mini-card"><div class="k">破碎片数</div><div class="v" style="color:#ffb74d">{{ furnace && furnace.outputCount > 0 ? furnace.brokenCount : '—' }}</div></div>
+            <div class="mini-card"><div class="k">完好片数</div><div class="v" style="color:#4dd6a8">{{ furnace && furnace.outputCount > 0 ? furnace.goodCount : '—' }}</div></div>
             <div class="mini-card"><div class="k">颗粒度</div><div class="v">{{ furnace ? furnace.particleCount : '-' }}</div></div>
           </div>
         </div>
+        <div v-if="furnace && furnace.nextAction" class="next-line">
+          <span class="next-label">下一步</span>{{ furnace.nextAction }}
+        </div>
+        <div v-if="furnace && furnace.lockReason" class="lock-line">{{ furnace.lockReason }}</div>
 
         <el-divider content-position="left">按炉号统计</el-divider>
         <el-table :data="furnaceStat" size="small" stripe max-height="200">
@@ -256,6 +354,85 @@ onMounted(async () => {
         </el-table>
       </div>
     </div>
+
+    <!-- 钢化批次台账：当前阶段 / 最终出炉结果 / 状态与不可操作原因 -->
+    <div class="glass glass-pad" style="margin-top: 14px">
+      <div class="section-title">钢化批次台账（阶段单向推进，出炉结果只确认一次）</div>
+      <el-table :data="batches" size="small" stripe highlight-current-row
+        :row-class-name="ledgerRowClass" @row-click="selectRow" max-height="300">
+        <el-table-column prop="batchNo" label="批次号" width="150" />
+        <el-table-column prop="furnaceNo" label="炉号" width="80" />
+        <el-table-column label="种类" width="90">
+          <template #default="{ row }">{{ row.glassTypeName }}</template>
+        </el-table-column>
+        <el-table-column label="厚度" width="70">
+          <template #default="{ row }">{{ row.thicknessMm }}mm</template>
+        </el-table-column>
+        <el-table-column label="当前阶段" width="110">
+          <template #default="{ row }">
+            <el-tag size="small" :type="stageTagType(row.stage)" effect="dark">{{ row.stageName }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="出炉片数" width="90">
+          <template #default="{ row }">
+            <span v-if="row.outputCount > 0">{{ row.outputCount }}</span>
+            <el-tag v-else size="small" type="warning" effect="plain">待补录</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="brokenCount" label="破碎" width="70">
+          <template #default="{ row }">{{ row.outputCount > 0 ? row.brokenCount : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="合格" width="70">
+          <template #default="{ row }">{{ row.outputCount > 0 ? row.goodCount : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="破碎率" width="80">
+          <template #default="{ row }">{{ row.outputCount > 0 ? row.brokenRate + '%' : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="状态 / 不可操作原因" min-width="280">
+          <template #default="{ row }">
+            <span v-if="row.finished && row.hasResult" class="ledger-lock">
+              ✓ 已出炉只读：{{ row.lockReason }}
+            </span>
+            <span v-else-if="row.resultMissing" class="ledger-missing">
+              ⚠ 已完成缺片数，可补录一次：{{ row.lockReason }}
+            </span>
+            <span v-else class="ledger-open">{{ row.nextAction }}</span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </div>
+
+    <!-- 出炉登记 / 历史补录对话框 -->
+    <el-dialog v-model="dischargeDialog" :title="resultMissing ? '补录出炉结果（仅一次）' : '出炉登记'" width="440px">
+      <el-alert v-if="resultMissing" type="warning" :closable="false" show-icon style="margin-bottom: 12px"
+        title="该批次炉段已完成但片数缺失，本次为补录；提交后结果立即锁定，不能再次修改。" />
+      <el-form label-width="96px" size="small">
+        <el-form-item label="出炉片数">
+          <el-input-number v-model="dischargeForm.outputCount" :min="1" :max="9999" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="破碎片数">
+          <el-input-number v-model="dischargeForm.brokenCount" :min="0" :max="dischargeForm.outputCount || 9999" controls-position="right" />
+        </el-form-item>
+        <el-form-item label="合格片数">
+          <span style="font-weight: 700; color: #4dd6a8">
+            {{ Math.max(0, Number(dischargeForm.outputCount || 0) - Number(dischargeForm.brokenCount || 0)) }} 片
+          </span>
+        </el-form-item>
+        <el-form-item label="破碎率">
+          <span style="font-weight: 700; color: #ffb74d">
+            {{ dischargeForm.outputCount > 0
+              ? (Math.round((Number(dischargeForm.brokenCount || 0) / Number(dischargeForm.outputCount)) * 1000) / 10)
+              : 0 }}%
+          </span>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button size="small" @click="dischargeDialog = false">取消</el-button>
+        <el-button size="small" :type="resultMissing ? 'warning' : 'success'" @click="submitDischarge">
+          {{ resultMissing ? '确认补录（仅此一次）' : '确认出炉' }}
+        </el-button>
+      </template>
+    </el-dialog>
 
     <!-- 磨边记录子功能 -->
     <div v-if="isGrinding" class="glass glass-pad" style="margin-top: 14px">
@@ -364,4 +541,19 @@ onMounted(async () => {
 .e-bar { height: 6px; border-radius: 4px; background: rgba(255,255,255,0.14); overflow: hidden; margin: 6px 0 4px; }
 .e-bar i { display: block; height: 100%; background: linear-gradient(90deg, #ffb74d, #e4573d); }
 .e-val { font-size: 10px; color: var(--ink-dim); }
+
+.state-banner { margin-top: 10px; }
+.param-lock { margin: 4px 0 10px; }
+.btn-wrap { display: inline-block; }
+.btn-wrap .el-button.is-disabled { pointer-events: auto; }
+.next-line { margin-top: 10px; font-size: 12px; color: #cdd7f5; }
+.next-label { display: inline-block; margin-right: 8px; padding: 1px 8px; border-radius: 9px;
+  background: rgba(77, 214, 168, 0.18); border: 1px solid rgba(77, 214, 168, 0.45); color: #4dd6a8; font-weight: 700; }
+.lock-line { margin-top: 6px; font-size: 11px; line-height: 1.6; color: #ffb74d; }
+.ledger-lock { color: #4dd6a8; }
+.ledger-missing { color: #ffb74d; }
+.ledger-open { color: #b9c4ee; }
+:deep(.el-table .row-finished) { background: rgba(77, 214, 168, 0.06); }
+:deep(.el-table .row-missing) { background: rgba(255, 183, 77, 0.08); }
+:deep(.el-table .el-table__row) { cursor: pointer; }
 </style>

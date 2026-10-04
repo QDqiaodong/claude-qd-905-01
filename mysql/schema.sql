@@ -336,6 +336,7 @@ INSERT INTO tempering_batch (batch_no, furnace_no, glass_type, thickness_mm, tem
 ('TB-20240509-006', 'TG-03', 'LOWE_BASE',    6,  655, 695, '655-695', 675, 240, 3.10, 0.130, 46, 10, 2, 'DONE',    '孙磊', UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('TB-20240510-007', 'TG-03', 'TINTED',       10, 670, 710, '670-710', 690, 360, 3.80, 0.110, 50, 7,  1, 'QUENCH',  '孙磊', UTC_TIMESTAMP() + INTERVAL 8 HOUR),
 ('TB-20240511-008', 'TG-02', 'FLOAT_CLEAR',  10, 675, 715, '675-715', 695, 330, 3.40, 0.140, 48, 0,  0, 'HEATING', '刘洋', UTC_TIMESTAMP() + INTERVAL 8 HOUR);
+('TB-20240509-009', 'TG-02', 'ULTRA_CLEAR',  6,  670, 710, '670-710', 688, 250, 3.30, 0.120, 47, NULL, NULL, 'DONE', '刘洋', UTC_TIMESTAMP() + INTERVAL 8 HOUR);
 
 INSERT INTO deep_process_record (record_no, process_type, batch_no, glass_type, thickness_mm, piece_count, film_system, target_material, film_thickness_nm, emissivity, spacer, gas_type, dew_point, pvb_thickness, autoclave_temp, autoclave_pressure, autoclave_minutes, result, remark, operator, created_at) VALUES
 ('DP-20240506-001', 'COATING',    'YP-2402-01', 'LOWE_BASE',   5,  60, '单银 Low-E',   '银 Ag',         120, 0.150, NULL,        NULL,   NULL, NULL, NULL, NULL, NULL,  'PASS', '辐射率 0.150 达到节能要求',                    '周涛', UTC_TIMESTAMP() + INTERVAL 8 HOUR),

@@ -51,7 +51,7 @@ public class ProcessController {
     // ---------------- 钢化 ----------------
 
     @GetMapping("/tempering")
-    public ApiResponse<List<TemperingBatch>> temperingList() {
+    public ApiResponse<List<FurnaceVO>> temperingList() {
         return ApiResponse.success(service.temperingList());
     }
 

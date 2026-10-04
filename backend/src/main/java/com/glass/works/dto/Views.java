@@ -103,5 +103,20 @@ public final class Views {
         private String stageName;
         private String operator;
         private List<StageVO> stages = new ArrayList<>();
+
+        /** 是否已走完加热→淬冷→冷却并出炉（终态，不可再推进 / 重新生产） */
+        private boolean finished;
+        /** 是否已有有效出炉结果（出炉片数为正）；有结果即终态只读，结果不可改写 */
+        private boolean hasResult;
+        /** 阶段已完成但片数缺失：允许补录一次出炉结果，补录后转只读 */
+        private boolean resultMissing;
+        /** 是否允许继续炉内推进（仅加热 / 淬冷 / 冷却段可推进） */
+        private boolean canAdvance;
+        /** 是否可提交出炉：冷却段正常出炉，或已完成但片数缺失时补录一次 */
+        private boolean canDischarge;
+        /** 下一步操作说明（如 推进到淬冷段 / 可登记出炉 / 待补录出炉结果） */
+        private String nextAction;
+        /** 不可继续操作的明确原因（可推进 / 可出炉时为空） */
+        private String lockReason;
     }
 }
